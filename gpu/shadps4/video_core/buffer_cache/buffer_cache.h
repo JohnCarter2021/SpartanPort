@@ -5,6 +5,7 @@
 
 #include "spartanport_copy.h"
 
+#include <chrono>
 #include <deque>
 #include <boost/container/small_vector.hpp>
 
@@ -130,6 +131,16 @@ private:
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
+    /// Diagnostic for the resident-memory audit (SPARTAN_BUFFER_STATS=1):
+    /// prints the currently-tracked resident intervals/bytes, throttled to
+    /// every 4096th ObtainBuffer call and at most once every 5 s (same
+    /// pattern as PrintBufferStats, so it cannot flood the log when
+    /// ObtainBuffer calls are far more frequent than 4096 per 5 s).
+    /// If the bytes climb across level
+    /// changes, resident memory grows with distinct guest blocks; if they
+    /// flatten, it is a bounded working set and no eviction is needed.
+    void PrintResidentStats();
+
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
@@ -186,6 +197,15 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+    /// Resident diagnostic counters (see PrintResidentStats): allocations
+    /// ever made by EnsureResident, and their total bytes. These only grow;
+    /// compare with the currently-tracked bytes to see replacement churn.
+    /// Allocations whose Backings were all replaced are no longer tracked
+    /// above, so ever-minus-current is not a leak figure on its own.
+    u64 resident_allocations{}, resident_bytes_ever{};
+    u64 resident_print_calls{};
+    std::chrono::steady_clock::time_point resident_print_window =
+        std::chrono::steady_clock::now();
 
     u32 arena_memory_type_index{};
     u32 block_size{};

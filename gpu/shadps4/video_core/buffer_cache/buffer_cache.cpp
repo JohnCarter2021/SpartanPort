@@ -300,6 +300,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const bool stats = BufferStatsEnabled();
     if (stats) {
         PrintBufferStats();
+        PrintResidentStats();
         NoteHotUse(device_addr, size);
     }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
@@ -457,6 +458,30 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     return new_arena;
 }
 
+void BufferCache::PrintResidentStats() {
+    if ((++resident_print_calls & 4095) != 0) {
+        return;
+    }
+    // Time throttle, same as PrintBufferStats: ObtainBuffer can run far
+    // more than 4096 times in 5 s, so the call throttle alone flooded the
+    // log (69,352 resident lines in one test run).
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration<double>(now - resident_print_window).count() < 5.0) {
+        return;
+    }
+    resident_print_window = now;
+    u64 resident_blocks{};
+    for (const auto& range : resident_ranges) {
+        resident_blocks += range.end - range.start;
+    }
+    std::printf("Buffer resident: %zu intervals, %llu blocks (%.2f MiB currently tracked), "
+                "%llu allocations ever (%.2f MiB ever)\n",
+                resident_ranges.Size(), static_cast<unsigned long long>(resident_blocks),
+                (resident_blocks << block_shift) / 1048576.0,
+                static_cast<unsigned long long>(resident_allocations),
+                resident_bytes_ever / 1048576.0);
+}
+
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
     u32 resident_blocks{};
     IntervalList bind_ranges;
@@ -475,6 +500,8 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         .memoryTypeIndex = arena_memory_type_index,
     };
     const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+    ++resident_allocations;
+    resident_bytes_ever += static_cast<u64>(resident_blocks) << block_shift;
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
