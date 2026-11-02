@@ -487,13 +487,20 @@ static size_t vma_index(uintptr_t a) { /* first VMA with end > a */
     while (lo<hi) { size_t mid=(lo+hi)/2; if (vmas[mid].end<=a) lo=mid+1; else hi=mid; }
     return lo;
 }
-static int vma_insert(size_t at, Vma v) {
-    if (vma_count==vma_capacity) {
-        size_t capacity=vma_capacity ? vma_capacity*2 : 256;
-        Vma *next=realloc(vmas,capacity*sizeof(*vmas));
-        if (!next) return -1;
-        vmas=next; vma_capacity=capacity;
+/* Ensure room for extra VMA entries. Called with the write lock held. */
+static int vma_reserve(size_t extra) {
+    if (vma_count+extra<=vma_capacity) return 0;
+    size_t needed=vma_count+extra, capacity=vma_capacity ? vma_capacity : 256;
+    while (capacity<needed) {
+        if (capacity>SIZE_MAX/2) { capacity=needed; break; }
+        capacity*=2;
     }
+    Vma *next=realloc(vmas,capacity*sizeof(*vmas));
+    if (!next) return -1;
+    vmas=next; vma_capacity=capacity; return 0;
+}
+static int vma_insert(size_t at, Vma v) {
+    if (vma_reserve(1)) return -1;
     memmove(vmas+at+1,vmas+at,(vma_count-at)*sizeof(*vmas));
     vmas[at]=v; ++vma_count; return 0;
 }
@@ -592,6 +599,13 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
         address=find_free(address,size,alignment);
         if (!address) return NO_MEMORY;
     }
+    /* Reserve VMA room before any destructive step: drop_range can split
+     * at both edges (2 inserts) and the final record is a third. If this
+     * fails, return now with the old mappings intact, so the caller's
+     * announce_mapped_locked() recovery still works. Without it, a
+     * vma_insert failure after host_map/drop_range would leave a host
+     * mapping with no VMA record behind. */
+    if (vma_reserve(3)) return NO_MEMORY;
     if (host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys)) return NO_MEMORY;
     /* Mappings replaced here (their GPU buffers and images were retired by retire_fixed, found
      * when a game maps pool chunks over themselves on a level reload) count for the report. */
@@ -600,7 +614,14 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
             if (vmas[i].kind!=KIND_RESERVED) ++fixed_replaced;
     void *mapped=(void *)address;
     drop_range(address,address+size);
-    if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return NO_MEMORY;
+    if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) {
+        /* Belt and braces for the reserve above: never leave a host
+         * mapping installed with no VMA record for it. Unmapping here
+         * leaves a clean hole; a later map can reuse the range, and
+         * nothing later will mistake it for free while mapped. */
+        host_unmap(address,size);
+        return NO_MEMORY;
+    }
     if (kind==KIND_FLEXIBLE) flexible_bytes+=size;
     if (kind!=KIND_RESERVED) queue_hook(HOOK_MAP,address,size);
     *inout=mapped;
@@ -996,6 +1017,18 @@ void *runtime_low_map(size_t size, int prot) {
     if (!p) allocation_failed("low memory map (guest image or stack)", size, NO_MEMORY);
     return p;
 }
+void runtime_low_unmap(void *pointer, size_t size) {
+    if (!pointer || !size) return;
+#ifdef _WIN32
+    /* low_map_from reserved+committed the whole region, so MEM_RELEASE with
+     * a zero size frees it. */
+    VirtualFree(pointer,0,MEM_RELEASE);
+#else
+    /* low_map_from mapped align_up(size, PAGE) bytes; the PAGE gap after it
+     * was never mapped and is left alone. */
+    munmap(pointer,align_up(size,PAGE));
+#endif
+}
 /* Host records the guest holds pointers to (ScePthread handles, the TLS block with the TCB,
  * mutex, cond, rwlock and attribute handles) come from 1 MiB slabs below the PS4 range. PS4
  * games keep lock owners in 40 bits: a spin lock that stores scePthreadSelf() & 0xffffffffff
@@ -1010,7 +1043,10 @@ void *runtime_low_map(size_t size, int prot) {
 #define LOW_CLASSES 7 /* 128 B .. 8 KiB including the header */
 #define LOW_MAGIC UINT32_C(0x4c4f5748)
 enum { LOW_LARGE=LOW_CLASSES, LOW_HOST };
-typedef struct { uint32_t magic, kind; } LowHeader;
+/* total is the mapped size of the block (LOW_LARGE only is unmapped on free;
+ * slab and host blocks are tracked by class / the host heap instead). The
+ * 64-byte header has room for it: magic + kind + total is 16 bytes. */
+typedef struct { uint32_t magic, kind; uint64_t total; } LowHeader;
 typedef struct LowFree { struct LowFree *next; } LowFree;
 static pthread_mutex_t low_lock=PTHREAD_MUTEX_INITIALIZER;
 static LowFree *low_free[LOW_CLASSES];
@@ -1034,7 +1070,8 @@ static unsigned char *low_carve(size_t total, uint32_t *kind) {
     unsigned c=0;
     while (c<LOW_CLASSES && (size_t)128<<c<total) ++c;
     if (c==LOW_CLASSES) {
-        *kind=LOW_LARGE; /* kept when freed: only TLS blocks of huge TLS segments get here */
+        *kind=LOW_LARGE; /* only TLS blocks of huge TLS segments get here;
+                           runtime_low_free() unmaps them (see below) */
         unsigned char *p=low_map_from(&handles_next,USER_MIN,total,PROT_READ|PROT_WRITE);
         if (!p) low_full=1;
         return p;
@@ -1064,7 +1101,7 @@ void *runtime_low_alloc(size_t size) {
     pthread_mutex_unlock(&low_lock);
     if (!block && !(block=low_host(total))) return NULL;
     memset(block,0,total);
-    *(LowHeader *)block=(LowHeader){LOW_MAGIC,kind};
+    *(LowHeader *)block=(LowHeader){LOW_MAGIC,kind,(uint64_t)total};
     unsigned char *p=block+LOW_HEADER;
     if ((uintptr_t)p+size>UINT64_C(1)<<40 && !__atomic_exchange_n(&low_high_logged,1,__ATOMIC_RELAXED))
         fprintf(stderr,"Runtime: guest handle %p is above 1 TiB; the game's 40-bit lock owners cannot hold it\n",(void *)p);
@@ -1084,7 +1121,19 @@ void runtime_low_free(void *pointer) {
 #endif
         return;
     }
-    if (h.kind==LOW_LARGE) return;
+    if (h.kind==LOW_LARGE) {
+        /* Previously this just returned, so a freed large block stayed mapped
+         * forever: its address space and its pages were never reclaimed, and
+         * handles_next kept advancing past it. Unmap it instead. This is
+         * safe for the only variable-size caller (thread TLS): the thread
+         * record clears its tls_block pointer before calling this, and the
+         * mapping is exclusively owned by the freeing thread, so no other
+         * allocation can be handed the same address in the meantime.
+         * handles_next is deliberately not rewound: the PAGE/64 KiB gap
+         * after the block was never mapped and stays as an overrun guard. */
+        if (h.total) runtime_low_unmap(block,(size_t)h.total);
+        return;
+    }
     pthread_mutex_lock(&low_lock);
     LowFree *f=(LowFree *)block; f->next=low_free[h.kind]; low_free[h.kind]=f;
     pthread_mutex_unlock(&low_lock);
