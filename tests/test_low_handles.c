@@ -29,6 +29,23 @@ static void check_block(void *p, size_t size) {
     assert(!((uintptr_t)p & 63));
     for (size_t i=0;i<size;++i) assert(!((unsigned char *)p)[i]);
 }
+#ifndef _WIN32
+/* Linux-only: is an address currently mapped? Used to prove a freed large
+ * block is really unmapped, not just kept around. */
+static int is_mapped(void *p) {
+    FILE *f=fopen("/proc/self/maps","r");
+    if (!f) return -1;
+    char line[512];
+    uintptr_t a=(uintptr_t)p;
+    int found=0;
+    while (fgets(line,sizeof line,f)) {
+        uintptr_t lo,hi;
+        if (sscanf(line,"%lx-%lx",&lo,&hi)==2 && a>=lo && a<hi) { found=1; break; }
+    }
+    fclose(f);
+    return found;
+}
+#endif
 static void low_handles(void) {
     void *first=runtime_low_alloc(200);
     check_block(first,200);
@@ -55,6 +72,15 @@ static void low_handles(void) {
     check_block(large,256*1024);
     assert((uintptr_t)large<TIB);
     runtime_low_free(large);
+    /* A freed large block must be unmapped, not kept: previously
+     * runtime_low_free() just returned for LOW_LARGE. */
+#ifndef _WIN32
+    assert(is_mapped(large)==0);
+#endif
+    void *large2=runtime_low_alloc(256*1024);
+    check_block(large2,256*1024);
+    assert((uintptr_t)large2<TIB);
+    runtime_low_free(large2);
     /* Guest mutex and cond handles come from the same slabs. */
     MutexInit init=(MutexInit)runtime_mutex_resolve("cmo1RIYva9o#libkernel");
     HandleOp destroy=(HandleOp)runtime_mutex_resolve("2Of0f+3mhhE#libkernel");
